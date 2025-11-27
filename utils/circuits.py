@@ -99,7 +99,6 @@ def hybrid_error_cnot(gates: List[tuple], p: float, f: float, eq_diff: int = 0):
     Returns:
         List of strings representing the error operations to be appended to a Circuit._circ_str.
     """
-    print(f"p: {p}, f: {f}")
     err_string = []
     errors = []
     PAULI_STR = ('I', 'X', 'Y', 'Z')

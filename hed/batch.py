@@ -276,8 +276,6 @@ class BatchCircuitBuilder:
             elif (self.erasure_circuit.pauli_bitmask & (self.cnot_support_bitmasks[check_num])) > 0 and self.erasure_circuit.noise_model.noise_dict.get("tqg", 0) > 0:
                 circuit.add_depolarize1(bitops.mask_iter_indices(self.erasure_circuit.pauli_bitmask & (self.cnot_support_bitmasks[check_num])), p=0.75)
             # Apply appropriate depolarizing noise based on erasure status
-            if self.code.distance == 3:
-                print(pattern['cnots_unerased'][check_num])
             if pattern['cnots_unerased'][check_num] and self.p_unerased > 0:
                 circuit.add_depolarize1(pattern['cnots_unerased'][check_num], p=self.p_unerased)
             if pattern['cnots_erased'][check_num]:
