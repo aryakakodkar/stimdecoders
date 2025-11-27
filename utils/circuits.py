@@ -1,4 +1,5 @@
 from typing import List, Literal, Tuple
+import numpy as np
 import stim
 import time
 
@@ -81,6 +82,98 @@ def pauli_erasure_cnot_optimized(gates: List[tuple], erasure_bitmask: int, p: fl
 
     return err_string
     
+def hybrid_error_cnot(gates: List[tuple], p: float, f: float, eq_diff: int = 0):
+    """Builds string list for hybrid Pauli + Erasure errors on CNOTs.
+    
+    All qubits can undergo errors. Each error has:
+    - Fraction f: erasure error (heralded, Pauli + erasure marker)
+    - Fraction 1-f: non-erasure error (unheralded, Pauli only)
+    Total erasure probability per qubit is f*p.
+
+    Args:
+        gates: List of (control, target) qubit index tuples for CNOTs.
+        p: Probability of error occurring on each CNOT.
+        f: Fraction of errors which are erasures (0 <= f <= 1).
+        eq_diff: Difference between data and fictitious ancilla qubit indices.
+
+    Returns:
+        List of strings representing the error operations to be appended to a Circuit._circ_str.
+    """
+    print(f"p: {p}, f: {f}")
+    err_string = []
+    errors = []
+    PAULI_STR = ('I', 'X', 'Y', 'Z')
+    
+    else_space = 1.0
+
+    for q1 in range(4):
+            for q2 in range(4):
+                for e1 in [0, 1]:
+                    for e2 in [0, 1]:
+                        if (q1, q2, e1, e2) == (0, 0, 0, 0): continue
+                        
+                        # For each qubit: 
+                        # - No error (identity, no erasure): probability (1-p)
+                        # - Pauli error without erasure: p*(1-f)/3 for each of X, Y, Z
+                        # - Pauli error with erasure: p*f/4 for each of I, X, Y, Z
+                        
+                        if e1:
+                            # Erasure on qubit 1
+                            p1 = p * f / 4
+                        else:
+                            # No erasure on qubit 1
+                            if q1 == 0:
+                                p1 = 1 - p
+                            else:
+                                p1 = p * (1 - f) / 3
+
+                        if e2:
+                            # Erasure on qubit 2
+                            p2 = p * f / 4
+                        else:
+                            # No erasure on qubit 2
+                            if q2 == 0:
+                                p2 = 1 - p
+                            else:
+                                p2 = p * (1 - f) / 3
+
+                        true_prob = p1 * p2
+                        errors.append((q1, q2, e1, e2, true_prob / else_space))
+                        else_space -= true_prob
+
+    # return errors
+
+    for gate in gates:
+        g0, g1 = gate[0], gate[1]
+        
+        for i in range(len(errors)):
+            q1, q2, e0, e1, err_prob = errors[i]
+            
+            parts = ""
+            
+            # Error prefix
+            if i == 0:
+                parts += f"CORRELATED_ERROR({err_prob}) "
+            else:
+                parts += f"ELSE_CORRELATED_ERROR({err_prob}) "
+
+            # Pauli errors (skip identity)
+            if q1 != 0:
+                parts += f"{PAULI_STR[q1]}{g0} "
+            if q2 != 0:
+                parts += f"{PAULI_STR[q2]}{g1} "
+            
+            # Erasure markers
+            if e0:
+                parts += f"X{g0 + eq_diff} "
+            if e1:
+                parts += f"X{g1 + eq_diff} "
+
+            # Single join and append
+            err_string.append(parts)
+
+    return err_string
+
 class Circuit:
     def __init__(self, code: codes.Stabilizer_Code):
         self._measurements = 0
@@ -294,7 +387,7 @@ class Circuit:
     def to_stim_circuit(self):
         """Converts the internal string representation to a stim.Circuit object."""
         return stim.Circuit("\n".join(self._circ_str))
-    
+
 def build_rsc_erasure_circuit(rsc: codes.RSC, noise_model: noise.Noise_Model, erasure_allocation_mode: Literal["all", "custom"]="all", custom_erasure_mask: int = None):
     """Builds the Stim circuit for the RSC code with specified noise.
 
@@ -390,3 +483,222 @@ def build_rsc_erasure_circuit(rsc: codes.RSC, noise_model: noise.Noise_Model, er
     circuit.add_observable([rsc.num_qubits - rsc.measurement_indices[qubit_id] for qubit_id in rsc.observable], cache=True)
 
     return circuit
+
+def build_rsc_hybrid_circuit(rsc: codes.RSC, noise_model: noise.Noise_Model):
+    """Builds the Stim circuit for the RSC code with specified noise. WARNING: Currently only supports hybrid Pauli-erasure noise.
+
+    Args:
+        code: The rotated surface code object
+        noise_model: The noise model to apply
+    
+    Returns:
+        The associated Circuit object
+    """
+    
+    circuit = Circuit(rsc)
+    circuit.set_noise_model(noise_model)
+    
+    # For hybrid circuits, all qubits can have erasures
+    # Set bitmasks for batch builder compatibility
+    all_qubit_mask = bitops.indices_to_mask(rsc.all_qubit_ids)
+    circuit.erasure_bitmask = all_qubit_mask
+    circuit.pauli_bitmask = all_qubit_mask
+
+    ## State preparation
+    circuit.add_reset(rsc.all_qubit_ids, cache_name="sp")
+    # TODO: Add state prep noise support
+
+    ## X-ancilla Hadamards
+    circuit.add_h_gate(rsc.x_ancilla_ids, cache_name="h")
+    # TODO: Add single-qubit gate noise support
+
+    ## CNOT rounds
+    for i, check_gates in enumerate(rsc.gates):
+        circuit.add_cnot(check_gates, cache_name=f"cnot_{i}")
+        if (p_tqg := noise_model.noise_dict.get('p', 0)) > 0 and (f_tqg := noise_model.noise_dict.get('f', 0)) > 0:
+            circuit._circ_str.extend(hybrid_error_cnot(gates=check_gates, p=p_tqg, f=f_tqg, eq_diff=rsc.eq_diff))
+        elif (p_tqg := noise_model.noise_dict.get('p', 0)) > 0:
+            circuit.add_depolarize1([q for gate in check_gates for q in gate], p_tqg)
+        
+        circuit.add_measurements([q + rsc.eq_diff for gate in check_gates for q in gate], reset=True)
+
+    ## X-ancilla Hadamards
+    circuit.add_h_gate(rsc.x_ancilla_ids)
+    # TODO: Add single-qubit gate noise support
+
+    ## Detect all measurements
+    circuit.detect_all_measurements()
+
+    ## Measure all ancillas
+    circuit.add_measurements(rsc.x_ancilla_ids + rsc.z_ancilla_ids, cache_name="meas")
+    circuit.add_detectors(range(rsc.num_ancillas // 2, 0, -1), cache=True)
+
+    ## Measure all data qubits
+    circuit.add_measurements(rsc.data_qubit_ids, cache_name="dmeas")
+
+    ## Measure plaquettes
+    circuit.add_detectors([[rsc.num_qubits - rsc.measurement_indices[anc_id] for anc_id in rsc.plaquettes[z_anc_id] + [z_anc_id]] for z_anc_id in rsc.z_ancilla_ids], parity=True, cache=True)
+
+    ## Observable
+    circuit.add_observable([rsc.num_qubits - rsc.measurement_indices[qubit_id] for qubit_id in rsc.observable], cache=True)
+
+    return circuit
+
+def build_repetition_code_hybrid_circuit(rep: codes.RepetitionCode, noise_model: noise.Noise_Model):
+    """Builds the Stim circuit for the Repetition code with specified noise. WARNING: Currently only supports hybrid Pauli-erasure noise.
+
+    Args:
+        code: The repetition code object
+        noise_model: The noise model to apply
+
+    Returns:
+        The associated Circuit object
+    """
+    
+    circuit = Circuit(rep)
+    circuit.set_noise_model(noise_model)
+
+    # TODO: bitmask operations
+
+    ## State preparation
+    circuit.add_reset(rep.all_qubit_ids, cache_name="sp")
+    # TODO: Add state prep noise support
+
+    ## CNOT rounds
+    for i in range(2):
+        circuit.add_cnot(rep.gates[i], cache_name=f"cnot_{i}")
+        if (p_tqg := noise_model.noise_dict.get('p', 0)) > 0 and (f_tqg := noise_model.noise_dict.get('f', 0)) > 0:
+            circuit._circ_str.extend(hybrid_error_cnot(gates=rep.gates[i], p=p_tqg, f=f_tqg, eq_diff=rep.eq_diff))
+        elif (p_tqg := noise_model.noise_dict.get('p', 0)) > 0:
+            circuit.add_depolarize1([q for gate in rep.gates[i] for q in gate], p_tqg)
+        
+        circuit.add_measurements([q + rep.eq_diff for gate in rep.gates[i] for q in gate], reset=True)
+
+    ## Detect all measurements
+    circuit.detect_all_measurements()
+
+    ## Measure all ancillas
+    circuit.add_measurements(rep.ancilla_ids, cache_name="meas")
+    circuit.add_detectors(range(rep.num_ancillas, 0, -1), cache=True)
+
+    ## Measure all data qubits
+    circuit.add_measurements(rep.data_qubit_ids, cache_name="dmeas")
+
+    ## Measure plaquettes
+    circuit.add_detectors([[rep.num_qubits - rep.measurement_indices[anc_id] for anc_id in rep.plaquettes[z_anc_id] + [z_anc_id]] for z_anc_id in rep.z_ancilla_ids], parity=True, cache=True)
+
+    ## Observable
+    circuit.add_observable([1], cache=True)
+
+    return circuit
+
+def cliffordize_hybrid(hybrid_circuit: Circuit, samples: np.ndarray) -> List[Circuit]:
+    """Converts a hybrid error circuit to a Clifford circuit by replacing erasure errors with depolarizing errors.
+
+    Args:
+        hybrid_circuit: The original Circuit object with hybrid errors.
+        samples: Array of erasure syndrome samples (shape: num_samples × num_erasure_measurements)
+
+    Returns:
+        List of Circuit objects with erasure errors replaced by depolarizing errors.
+    """
+    circuit_cache = {}
+    circuits = []
+    
+    # Determine if RSC or RepetitionCode
+    is_rsc = isinstance(hybrid_circuit.code, codes.RSC)
+    is_rep = isinstance(hybrid_circuit.code, codes.RepetitionCode)
+    
+    if not (is_rsc or is_rep):
+        raise NotImplementedError("Currently only RepetitionCode and RSC are supported for cliffordization of hybrid circuits.")
+
+    for sample in samples:
+        sample_bytes = sample.tobytes()
+        if sample_bytes in circuit_cache:
+            circuits.append(circuit_cache[sample_bytes])
+            continue
+
+        circuit = Circuit(hybrid_circuit.code)
+        circuit.set_noise_model(hybrid_circuit.noise_model)
+
+        ## State preparation
+        circuit._circ_str.append(hybrid_circuit.cached_strings["sp"])
+        
+        if is_rsc:
+            ## X-ancilla Hadamards
+            circuit._circ_str.append(hybrid_circuit.cached_strings["h"])
+        
+        ## CNOT rounds
+        sample_index = 0
+        num_rounds = 4 if is_rsc else 2
+        
+        for gate_index in range(num_rounds):
+            cnot_gates = hybrid_circuit.code.gates[gate_index]
+            circuit._circ_str.append(hybrid_circuit.cached_strings[f"cnot_{gate_index}"])
+            erased = []
+            unerased = []
+
+            # For each CNOT gate, check if either qubit was erased
+            for gate in cnot_gates:
+                control, target = gate
+                # Check erasure measurements for both qubits
+                control_erased = sample[sample_index] if sample_index < len(sample) else False
+                target_erased = sample[sample_index + 1] if sample_index + 1 < len(sample) else False
+                
+                if control_erased:
+                    erased.append(control)
+                else:
+                    unerased.append(control)
+                
+                if target_erased:
+                    erased.append(target)
+                else:
+                    unerased.append(target)
+                
+                sample_index += 2
+
+            # Remove duplicates
+            erased = list(set(erased))
+            unerased = list(set(unerased))
+
+            # Apply depolarizing noise based on whether qubits were erased
+            if (p := hybrid_circuit.noise_model.noise_dict.get('p', 0)) > 0:
+                f = hybrid_circuit.noise_model.noise_dict.get('f', 0)
+                if unerased:
+                    # Non-erased qubits get depolarizing noise with rate p*(1-f)
+                    circuit.add_depolarize1(unerased, p * (1 - f))
+                
+                if erased:
+                    # Erased qubits get depolarizing noise with rate 0.75 (maximally mixed)
+                    circuit.add_depolarize1(erased, 0.75)
+        
+        if is_rsc:
+            ## X-ancilla Hadamards
+            circuit.add_h_gate(hybrid_circuit.code.x_ancilla_ids)
+        
+        ## Measure all ancillas
+        circuit._circ_str.append(hybrid_circuit.cached_strings["meas"])
+        
+        if is_rsc:
+            # Z-ancilla detectors (skip detector_cache[0] which is for erasure measurements)
+            circuit._circ_str.append(hybrid_circuit.detector_cache[0])
+        else:
+            # RepetitionCode detectors (skip detector_cache[0] which is for erasure measurements)
+            circuit.append_to_circ_str(hybrid_circuit.detector_cache[1: 1 + hybrid_circuit.code.num_ancillas])
+        
+        ## Measure all data qubits
+        circuit._circ_str.append(hybrid_circuit.cached_strings["dmeas"])
+        
+        ## Plaquette detectors
+        if is_rsc:
+            circuit.append_to_circ_str(hybrid_circuit.detector_cache[1:])
+        else:
+            circuit.append_to_circ_str(hybrid_circuit.detector_cache[1 + hybrid_circuit.code.num_ancillas:])
+        
+        ## Observable
+        circuit._circ_str.append(hybrid_circuit.cached_strings["obs_0"])
+
+        circuit_cache[sample_bytes] = circuit
+        circuits.append(circuit)
+
+    return circuits

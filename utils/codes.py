@@ -500,4 +500,268 @@ class RSC(Stabilizer_Code):
         except ImportError:
             return svg_string
     
+class RepetitionCode(Stabilizer_Code):
+    def __init__(self, distance: int):
+        super().__init__(distance, check_density=2)
+        del self.x_ancillas
+        del self.x_ancilla_ids
 
+        self.num_qubits = 2*distance - 1
+        self.num_data_qubits = distance
+        self.num_ancillas = distance - 1
+
+        self.measurement_indices = {}
+
+        self._build_lattice()
+        self._build_checks()
+
+    def _build_lattice(self):
+        """Builds the lattice of the repetition code."""
+        index = 1
+        ancilla_index = 0
+        data_index = self.num_ancillas
+
+        for i in range(self.distance):
+            self.add_data_qubit((2*i, 0), index)
+            self.observable.append(index)
+            self.measurement_indices[index] = data_index
+            data_index += 1
+            index += 1
+
+            if i < self.distance - 1:
+                self.add_z_ancilla((2*i + 1, 1), index)
+                self.measurement_indices[index] = ancilla_index
+                ancilla_index += 1
+                index += 1
+
+        self.eq_diff = index
+
+    def _build_checks(self):
+        """Builds the checks for the repetition code."""
+        for i in range(self.distance - 1):
+            ancilla_id = self.z_ancilla_ids[i]
+            self.gates[0].append((ancilla_id - 1, ancilla_id))
+            self.gates[1].append((ancilla_id + 1, ancilla_id))
+            self.plaquettes[ancilla_id].extend([ancilla_id - 1, ancilla_id + 1])
+
+    def draw_lattice(self, numbering=True):
+        """
+        Draws the lattice of the repetition code as an SVG.
+
+        Args:
+            numbering (bool): Whether to number the qubits with their IDs.
+
+        Returns:
+            IPython.display.SVG or str: SVG display object in Jupyter, or SVG string otherwise.
+        """
+        # Find bounds
+        all_coords = list(self.data_qubits.keys()) + list(self.z_ancillas.keys())
+        if not all_coords:
+            svg_string = '<svg width="100" height="100"></svg>'
+        else:
+            # Find max ID length to size circles appropriately
+            all_ids = [q.id for q in self.data_qubits.values()] + \
+                      [q.id for q in self.z_ancillas.values()]
+            max_id_digits = len(str(max(all_ids))) if all_ids else 1
+            
+            # Adaptive radius based on number of digits
+            if max_id_digits == 1:
+                radius = 10
+                font_size = 10
+            elif max_id_digits == 2:
+                radius = 12
+                font_size = 9
+            else:  # 3+ digits
+                radius = 13
+                font_size = 8
+            
+            min_x = min(c[0] for c in all_coords)
+            max_x = max(c[0] for c in all_coords)
+            min_y = min(c[1] for c in all_coords)
+            max_y = max(c[1] for c in all_coords)
+            
+            # Scale and padding
+            scale = 30  # pixels per unit
+            padding = 40
+            
+            width = int((max_x - min_x) * scale + 2 * padding)
+            height = int((max_y - min_y) * scale + 2 * padding)
+            
+            def transform_x(x):
+                return (x - min_x) * scale + padding
+            
+            def transform_y(y):
+                return (y - min_y) * scale + padding
+            
+            svg_parts = [f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">']
+            
+            # Draw horizontal line through data qubits
+            data_coords = sorted(self.data_qubits.keys())
+            if len(data_coords) >= 2:
+                x_start = transform_x(data_coords[0][0])
+                x_end = transform_x(data_coords[-1][0])
+                y_line = transform_y(data_coords[0][1])
+                svg_parts.append(f'<line x1="{x_start}" y1="{y_line}" x2="{x_end}" y2="{y_line}" stroke="#e0e0e0" stroke-width="3"/>')
+            
+            # Draw data qubits (black)
+            for coord, qubit in self.data_qubits.items():
+                x, y = transform_x(coord[0]), transform_y(coord[1])
+                svg_parts.append(f'<circle cx="{x}" cy="{y}" r="{radius}" fill="black"/>')
+                if numbering:
+                    svg_parts.append(f'<text x="{x}" y="{y + font_size//3}" font-size="{font_size}" font-family="monospace" fill="white" text-anchor="middle">{qubit.id}</text>')
+            
+            # Draw z-ancillas (soft blue)
+            for coord, qubit in self.z_ancillas.items():
+                x, y = transform_x(coord[0]), transform_y(coord[1])
+                svg_parts.append(f'<circle cx="{x}" cy="{y}" r="{radius}" fill="#4dabf7"/>')
+                if numbering:
+                    svg_parts.append(f'<text x="{x}" y="{y + font_size//3}" font-size="{font_size}" font-family="monospace" fill="white" text-anchor="middle">{qubit.id}</text>')
+            
+            svg_parts.append('</svg>')
+            svg_string = '\n'.join(svg_parts)
+        
+        # Return IPython SVG object if in Jupyter, otherwise return string
+        try:
+            from IPython.display import SVG
+            return SVG(svg_string)
+        except ImportError:
+            return svg_string
+
+    def draw_checks(self):
+        """
+        Draws the CNOT gates for each check of the repetition code as SVG diagrams.
+
+        Returns:
+            IPython.display.SVG or str: SVG display object showing both checks (2 rounds).
+        """
+        # Find max ID length for sizing
+        all_ids = [q.id for q in self.data_qubits.values()] + \
+                  [q.id for q in self.z_ancillas.values()]
+        max_id_digits = len(str(max(all_ids))) if all_ids else 1
+        
+        # Adaptive radius based on number of digits
+        if max_id_digits == 1:
+            radius = 10
+            font_size = 10
+        elif max_id_digits == 2:
+            radius = 12
+            font_size = 9
+        else:  # 3+ digits
+            radius = 15
+            font_size = 8
+        
+        # Get bounds
+        all_coords = list(self.data_qubits.keys()) + list(self.z_ancillas.keys())
+        min_x = min(c[0] for c in all_coords)
+        max_x = max(c[0] for c in all_coords)
+        min_y = min(c[1] for c in all_coords)
+        max_y = max(c[1] for c in all_coords)
+        
+        scale = 30
+        padding = 50  # Extra padding for labels
+        single_width = int((max_x - min_x) * scale + 2 * padding)
+        single_height = int((max_y - min_y) * scale + 2 * padding)
+        
+        # Total SVG size (1x2 horizontal layout for 2 checks)
+        spacing = 10
+        total_width = single_width * 2 + spacing * 3
+        total_height = single_height + spacing * 2
+        
+        def transform_x(x, offset_x=0):
+            return (x - min_x) * scale + padding + offset_x
+        
+        def transform_y(y, offset_y=0):
+            return (y - min_y) * scale + padding + offset_y
+        
+        svg_parts = [f'<svg width="{total_width}" height="{total_height}" xmlns="http://www.w3.org/2000/svg">']
+        
+        # Draw 2 checks side by side
+        for check_num in range(2):
+            offset_x = check_num * (single_width + spacing) + spacing
+            offset_y = spacing
+            
+            # Title
+            svg_parts.append(f'<text x="{offset_x + single_width//2}" y="{offset_y + 20}" font-size="14" font-weight="bold" font-family="monospace" text-anchor="middle">CHECK {check_num + 1}</text>')
+
+            # Draw horizontal line through data qubits
+            data_coords = sorted(self.data_qubits.keys())
+            if len(data_coords) >= 2:
+                x_start = transform_x(data_coords[0][0], offset_x)
+                x_end = transform_x(data_coords[-1][0], offset_x)
+                y_line = transform_y(data_coords[0][1], offset_y)
+                svg_parts.append(f'<line x1="{x_start}" y1="{y_line}" x2="{x_end}" y2="{y_line}" stroke="#e0e0e0" stroke-width="3"/>')
+            
+            # Collect qubits involved in CNOTs for this check
+            cnot_qubits = set()
+            for gate in self.gates[check_num]:
+                cnot_qubits.add(gate[0])
+                cnot_qubits.add(gate[1])
+            
+            # Draw all qubits not involved in CNOTs
+            for coord, qubit in self.data_qubits.items():
+                if qubit.id not in cnot_qubits:
+                    x, y = transform_x(coord[0], offset_x), transform_y(coord[1], offset_y)
+                    svg_parts.append(f'<circle cx="{x}" cy="{y}" r="{radius}" fill="black"/>')
+                    svg_parts.append(f'<text x="{x}" y="{y + font_size//3}" font-size="{font_size}" font-family="monospace" fill="white" text-anchor="middle">{qubit.id}</text>')
+            
+            for coord, qubit in self.z_ancillas.items():
+                if qubit.id not in cnot_qubits:
+                    x, y = transform_x(coord[0], offset_x), transform_y(coord[1], offset_y)
+                    svg_parts.append(f'<circle cx="{x}" cy="{y}" r="{radius}" fill="#4dabf7"/>')
+                    svg_parts.append(f'<text x="{x}" y="{y + font_size//3}" font-size="{font_size}" font-family="monospace" fill="white" text-anchor="middle">{qubit.id}</text>')
+            
+            # Draw CNOT gates
+            for gate in self.gates[check_num]:
+                control = self.qubit_with_id(gate[0])
+                target = self.qubit_with_id(gate[1])
+                
+                # Z-ancilla is always the target for repetition code
+                color = '#4dabf7'
+                
+                cx = transform_x(control.coords[0], offset_x)
+                cy = transform_y(control.coords[1], offset_y)
+                tx = transform_x(target.coords[0], offset_x)
+                ty = transform_y(target.coords[1], offset_y)
+                
+                # Calculate line endpoints to stop at target edge
+                target_radius = 8
+                dx = tx - cx
+                dy = ty - cy
+                length = (dx**2 + dy**2)**0.5
+                if length > 0:
+                    dx_norm = dx / length
+                    dy_norm = dy / length
+                    line_start_x = cx + dx_norm * 5
+                    line_start_y = cy + dy_norm * 5
+                    line_end_x = tx - dx_norm * target_radius
+                    line_end_y = ty - dy_norm * target_radius
+                else:
+                    line_start_x, line_start_y = cx, cy
+                    line_end_x, line_end_y = tx, ty
+                
+                # Draw line connecting control and target
+                svg_parts.append(f'<line x1="{line_start_x}" y1="{line_start_y}" x2="{line_end_x}" y2="{line_end_y}" stroke="{color}" stroke-width="2"/>')
+                
+                # Draw control (filled circle)
+                svg_parts.append(f'<circle cx="{cx}" cy="{cy}" r="5" fill="{color}"/>')
+                
+                # Draw target (circle with plus sign)
+                svg_parts.append(f'<circle cx="{tx}" cy="{ty}" r="{target_radius}" fill="white" stroke="{color}" stroke-width="2"/>')
+                svg_parts.append(f'<line x1="{tx}" y1="{ty - target_radius}" x2="{tx}" y2="{ty + target_radius}" stroke="{color}" stroke-width="2"/>')
+                svg_parts.append(f'<line x1="{tx - target_radius}" y1="{ty}" x2="{tx + target_radius}" y2="{ty}" stroke="{color}" stroke-width="2"/>')
+                
+                # Add qubit ID labels
+                label_offset = 12
+                svg_parts.append(f'<text x="{cx}" y="{cy - label_offset}" font-size="{font_size}" font-family="monospace" text-anchor="middle">{control.id}</text>')
+                svg_parts.append(f'<text x="{tx}" y="{ty + label_offset + font_size}" font-size="{font_size}" font-family="monospace" text-anchor="middle">{target.id}</text>')
+        
+        svg_parts.append('</svg>')
+        svg_string = '\n'.join(svg_parts)
+        
+        # Return IPython SVG object if in Jupyter, otherwise return string
+        try:
+            from IPython.display import SVG
+            return SVG(svg_string)
+        except ImportError:
+            return svg_string
+    

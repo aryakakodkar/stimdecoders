@@ -14,34 +14,43 @@ class BatchCircuitBuilder:
     """Optimized batch builder for Clifford circuits from erasure syndromes.
     
     This class pre-computes invariant circuit components and uses templates to
-    quickly build circuits for multiple syndromes.
+    quickly build circuits for multiple syndromes. Supports both RSC and RepetitionCode.
     """
     
     def __init__(self, erasure_circuit: circuits.Circuit):
         """Initialize the batch builder.
         
         Args:
-            code: The stabilizer code object (WARNING: currently only RSC supported)
-            erasure_circuit: The erasure circuit
-            noise_dict: Noise parameters dictionary
+            erasure_circuit: The erasure or hybrid circuit (RSC or RepetitionCode)
         """
         self.code = erasure_circuit.code
-
-        if not isinstance(self.code, codes.RSC):
-            raise TypeError("BatchCircuitBuilder currently only supports RSC codes.")
-        
         self.erasure_circuit = erasure_circuit
         self.noise_dict = erasure_circuit.noise_model.noise_dict
         
-        # Get measurement set information
-        self.meas_sets, self.meas_sets_norms = erasure_circuit.get_measurement_sets()
-        self.erasure_bitmask = erasure_circuit.erasure_bitmask
+        # Determine code type
+        self.is_rsc = isinstance(self.code, codes.RSC)
+        self.is_repetition = isinstance(self.code, codes.RepetitionCode)
+        
+        if not (self.is_rsc or self.is_repetition):
+            raise TypeError("BatchCircuitBuilder supports RSC and RepetitionCode only.")
+        
+        # RSC-specific initialization
+        if self.is_rsc:
+            self.meas_sets, self.meas_sets_norms = erasure_circuit.get_measurement_sets()
+            self.erasure_bitmask = erasure_circuit.erasure_bitmask
 
         # Pre-compute circuit template components
         self._precompute_template()
         
     def _precompute_template(self):
         """Pre-compute the invariant parts of the circuit."""
+        if self.is_rsc:
+            self._precompute_template_rsc()
+        elif self.is_repetition:
+            self._precompute_template_repetition()
+    
+    def _precompute_template_rsc(self):
+        """Pre-compute template for RSC codes."""
         # Store indices for each measurement set segment
         self.meas_indices = []
         curr_idx = 0
@@ -49,12 +58,17 @@ class BatchCircuitBuilder:
             self.meas_indices.append((curr_idx, curr_idx + norm))
             curr_idx += norm
         
-        # Pre-compute which stages are active (have erasure errors possible)
+        # Pre-compute which stages are active (have erasure errors possible or hybrid noise)
+        # For hybrid circuits, we need to process stages even if no erasures occur
+        # because we still apply depolarizing noise to unerased qubits
+        # We need to process if p > 0 (there's depolarizing noise to apply, even if all goes to erasure)
+        has_depolarizing_noise = self.noise_dict.get('p', 0) > 0
+        
         self.active_stages = {
             'sp': self.code.sp_support & self.erasure_bitmask > 0 and self.noise_dict.get('sp-e', 0) > 0,
             'hadamard1': self.code.hadamard_support & self.erasure_bitmask > 0 and self.noise_dict.get('sqg-e', 0) > 0,
-            'cnots': [(self.code.cnot_bitmasks[i] >> self.code.eq_diff) & self.erasure_bitmask > 0 and
-                     self.noise_dict.get('tqg-e', 0) > 0 for i in range(4)],
+            'cnots': [((self.code.cnot_bitmasks[i] >> self.code.eq_diff) & self.erasure_bitmask > 0 and
+                      self.noise_dict.get('tqg-e', 0) > 0) or has_depolarizing_noise for i in range(4)],
             'hadamard2': self.code.hadamard_support & self.erasure_bitmask > 0 and self.noise_dict.get('sqg-e', 0) > 0,
             'ancilla_meas': self.code.ancilla_measure_support & self.erasure_bitmask > 0 and
                            self.noise_dict.get('meas-e', 0) > 0,
@@ -74,17 +88,48 @@ class BatchCircuitBuilder:
         self.base_measurements = self.erasure_circuit.cached_strings["meas"]
         self.base_data_measurements = self.erasure_circuit.cached_strings["dmeas"]
         
-        # Pre-cache Pauli error probability for CNOTs
+        # Pre-cache Pauli error probabilities
         self.p_tqg_pauli = self.noise_dict.get('tqg', 0)
+        p = self.noise_dict.get('p', 0)
+        f = self.noise_dict.get('f', 0)
+        self.p_unerased = p * (1 - f)
+    
+    def _precompute_template_repetition(self):
+        """Pre-compute template for Repetition codes."""
+        # Base circuit strings
+        self.base_reset = self.erasure_circuit.cached_strings["sp"]
+        self.base_cnots = [self.erasure_circuit.cached_strings[f"cnot_{i}"] for i in range(2)]
+        self.base_measurements = self.erasure_circuit.cached_strings["meas"]
+        self.base_data_measurements = self.erasure_circuit.cached_strings["dmeas"]
+        
+        # Pre-compute Pauli probabilities
+        p = self.noise_dict.get('p', 0)
+        f = self.noise_dict.get('f', 0)
+        self.p_unerased = p * (1 - f)
+        self.p_erased = 0.75
+        
+        # Number of qubits measured per round (for indexing into syndrome)
+        self.qubits_per_round = self.code.num_qubits - 1
 
-    def _extract_erasures_vectorized(self, syndromes: np.ndarray) -> List[Dict[str, List[int]]]:
+    def _extract_erasures_vectorized(self, syndromes: np.ndarray):
         """Extract erasure qubit indices from syndromes in a vectorized manner.
         
         Args:
             syndromes: Array of syndromes (num_syndromes, syndrome_length)
             
         Returns:
-            List of dictionaries mapping stage names to erasure qubit indices
+            List of patterns (format depends on code type)
+        """
+        if self.is_rsc:
+            return self._extract_erasures_vectorized_rsc(syndromes)
+        elif self.is_repetition:
+            return self._extract_erasures_vectorized_repetition(syndromes)
+    
+    def _extract_erasures_vectorized_rsc(self, syndromes: np.ndarray) -> List[Dict[str, List[int]]]:
+        """Extract erasure qubit indices from syndromes for RSC.
+        
+        For hybrid circuits, we need to track both erased and unerased qubits
+        to apply appropriate depolarizing noise rates.
         """
         erasure_patterns = []
         
@@ -111,16 +156,37 @@ class BatchCircuitBuilder:
                 pattern['hadamard1'] = []
             
             # CNOT erasures for each check
-            pattern['cnots'] = []
+            pattern['cnots_erased'] = []
+            pattern['cnots_unerased'] = []
             for check_num in range(4):
                 if self.active_stages['cnots'][check_num]:
                     start, end = self.meas_indices[stage_idx]
-                    erased = [self.meas_sets[stage_idx][i] - self.code.eq_diff 
-                             for i, m in enumerate(syndrome[start:end]) if m]
-                    pattern['cnots'].append(erased if erased else [])
+                    # Each CNOT gate has 2 syndrome bits (control, target)
+                    erased = []
+                    unerased = []
+                    
+                    syndrome_slice = syndrome[start:end]
+                    for i, (control, target) in enumerate(self.code.gates[check_num]):
+                        control_erased = syndrome_slice[2*i]
+                        target_erased = syndrome_slice[2*i + 1]
+                        
+                        if control_erased:
+                            erased.append(control)
+                        else:
+                            unerased.append(control)
+                        
+                        if target_erased:
+                            erased.append(target)
+                        else:
+                            unerased.append(target)
+                    
+                    # Remove duplicates while preserving efficiency
+                    pattern['cnots_erased'].append(list(dict.fromkeys(erased)))
+                    pattern['cnots_unerased'].append(list(dict.fromkeys(unerased)))
                     stage_idx += 1
                 else:
-                    pattern['cnots'].append([])
+                    pattern['cnots_erased'].append([])
+                    pattern['cnots_unerased'].append([])
             
             # Second Hadamard erasures
             if self.active_stages['hadamard2']:
@@ -144,15 +210,46 @@ class BatchCircuitBuilder:
         
         return erasure_patterns
     
-    def _build_circuit_from_pattern(self, pattern: Dict[str, List[int]]) -> circuits.Circuit:
+    def _extract_erasures_vectorized_repetition(self, syndromes: np.ndarray) -> List[Tuple[List[List[int]], List[List[int]]]]:
+        """Extract erased and unerased qubit indices from syndromes for RepetitionCode."""
+        patterns = []
+        
+        for syndrome in syndromes:
+            erased = [[], []]
+            unerased = [[], []]
+            
+            sample_index = 0
+            for gate_index in range(2):
+                # Process each qubit in this CNOT round
+                for i, result in enumerate(syndrome[sample_index:sample_index + self.qubits_per_round]):
+                    qubit = self.code.gates[gate_index][i // 2][i % 2]
+                    if result:
+                        erased[gate_index].append(qubit)
+                    else:
+                        unerased[gate_index].append(qubit)
+                
+                sample_index += self.qubits_per_round
+            
+            patterns.append((erased, unerased))
+        
+        return patterns
+    
+    def _build_circuit_from_pattern(self, pattern) -> circuits.Circuit:
         """Build a circuit from a pre-computed erasure pattern.
         
         Args:
-            pattern: Dictionary mapping stage names to erasure qubit indices
+            pattern: Pattern data (format depends on code type)
             
         Returns:
             The constructed Circuit object
         """
+        if self.is_rsc:
+            return self._build_circuit_from_pattern_rsc(pattern)
+        elif self.is_repetition:
+            return self._build_circuit_from_pattern_repetition(pattern)
+    
+    def _build_circuit_from_pattern_rsc(self, pattern: Dict[str, List[int]]) -> circuits.Circuit:
+        """Build a circuit from a pre-computed erasure pattern for RSC."""
         circuit = circuits.Circuit(code=self.code)
         
         # Reset
@@ -178,8 +275,13 @@ class BatchCircuitBuilder:
                 circuit._circ_str.append(self.erasure_circuit.cached_strings[f"cnot_{check_num}_pauli"])
             elif (self.erasure_circuit.pauli_bitmask & (self.cnot_support_bitmasks[check_num])) > 0 and self.erasure_circuit.noise_model.noise_dict.get("tqg", 0) > 0:
                 circuit.add_depolarize1(bitops.mask_iter_indices(self.erasure_circuit.pauli_bitmask & (self.cnot_support_bitmasks[check_num])), p=0.75)
-            if pattern['cnots'][check_num]:
-                circuit.add_depolarize1(pattern['cnots'][check_num], p=0.75)
+            # Apply appropriate depolarizing noise based on erasure status
+            if self.code.distance == 3:
+                print(pattern['cnots_unerased'][check_num])
+            if pattern['cnots_unerased'][check_num] and self.p_unerased > 0:
+                circuit.add_depolarize1(pattern['cnots_unerased'][check_num], p=self.p_unerased)
+            if pattern['cnots_erased'][check_num]:
+                circuit.add_depolarize1(pattern['cnots_erased'][check_num], p=0.75)
         
         # Second Hadamard
         circuit._circ_str.append(self.base_hadamard)
@@ -203,6 +305,37 @@ class BatchCircuitBuilder:
 
         return circuit
     
+    def _build_circuit_from_pattern_repetition(self, pattern: Tuple[List[List[int]], List[List[int]]]) -> circuits.Circuit:
+        """Build a circuit from a pre-computed pattern for RepetitionCode."""
+        erased, unerased = pattern
+        
+        circuit = circuits.Circuit(code=self.code)
+        circuit.set_noise_model(self.erasure_circuit.noise_model)
+        
+        # State preparation
+        circuit._circ_str.append(self.base_reset)
+        
+        # CNOT rounds
+        for gate_index in range(2):
+            circuit._circ_str.append(self.base_cnots[gate_index])
+            
+            # Add depolarizing errors for unerased qubits
+            if self.p_unerased > 0 and unerased[gate_index]:
+                circuit.add_depolarize1(unerased[gate_index], self.p_unerased)
+            
+            # Add depolarizing errors for erased qubits (effective Pauli error after erasure)
+            if erased[gate_index]:
+                circuit.add_depolarize1(erased[gate_index], self.p_erased)
+        
+        # Measurements and detectors
+        circuit._circ_str.append(self.base_measurements)
+        circuit._circ_str.append(self.erasure_circuit.detector_cache[0])
+        circuit._circ_str.append(self.base_data_measurements)
+        circuit.append_to_circ_str(self.erasure_circuit.detector_cache[1: 1 + self.code.num_ancillas])
+        circuit._circ_str.append(self.erasure_circuit.cached_strings["obs_0"])
+
+        return circuit
+    
     def build_batch(self, syndromes: np.ndarray) -> List[stim.Circuit]:
         """Build Clifford circuits for a batch of syndromes.
         
@@ -219,7 +352,6 @@ class BatchCircuitBuilder:
         circuits_list = []
         for pattern in patterns:
             circuit = self._build_circuit_from_pattern(pattern)
-            # print(circuit)
             circuits_list.append(circuit.to_stim_circuit())
         
         return circuits_list
@@ -266,10 +398,8 @@ def batch_build_clifford_circuits(erasure_circuit: circuits.Circuit,
     BatchCircuitBuilder and uses it to efficiently build circuits.
     
     Args:
-        rsc: The RSC code object
-        erasure_circuit: The erasure circuit
+        erasure_circuit: The erasure or hybrid circuit (RSC or RepetitionCode)
         syndromes: Array of syndromes (num_syndromes, syndrome_length)
-        noise_dict: Noise parameters dictionary
         use_cache: Whether to use caching
         circuit_cache: Optional pre-existing cache
         
